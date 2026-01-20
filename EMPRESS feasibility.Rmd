@@ -36,11 +36,15 @@ EMPRESS_allocation <- read_parquet(allocation)
 ### 3.x Code for safety report included cut off
 
 ```{r eval=FALSE, include=FALSE}
+#------------------------------------------------------------
 # 1) Cutoff date
+#------------------------------------------------------------
 Safety_trigger_date <- date("2026-02-18")
 cuttoff_date <- Safety_trigger_date - days(105) + 1
 
-# 2) Subset of enrolled participants in INCEPT-Albumin <= cuttoff_date
+#------------------------------------------------------------
+# 2) Subset of enrolled participants in EMPRESS <= cuttoff_date
+#------------------------------------------------------------
 EMPRESS_master_safety <- EMPRESS_events %>% 
   filter(
       event_type_name == "enrolment" &
@@ -50,7 +54,7 @@ EMPRESS_master_safety <- EMPRESS_events %>%
       date(with_tz(timestamp, "Europe/Copenhagen")) <= cuttoff_date 
   ) %>% 
   
-  # Rename timestamp to rand_date_time_utc and event_id to rand_datetime_id
+  # Rename timestamp to rand_datetime_utc
   rename(
     rand_datetime_utc = timestamp,
          ) %>% 
@@ -92,27 +96,12 @@ EMPRESS_master_feasibility <- EMPRESS_events %>%
   )
 ```
 
-### 3.2 Remove excluded ssids
+### 3.2 Removal of unwanted spillovers and uuid
 
 ```{r}
-# 1) Excluded ssids <= cuttoff_date
-EMPRESS_excluded_ssid <- EMPRESS_events %>% 
-  filter(
-      event_type_name == "exclusion" &
-      event_description == "empress_platform"
-  ) %>% 
-  mutate(
-     # Local datetime for exclusion before cuttoff date
-      date(with_tz(timestamp, "Europe/Copenhagen")) 
-  ) %>% pull(ssid)
-```
-
-### 3.3 Removal of unwanted spillovers and uuid
-
-```{r}
-# ----------------------------
+#------------------------------------------------------------
 # 1) Scan for Pyhton spill-over
-# ----------------------------
+#------------------------------------------------------------
 py_obj_summary_forms <- EMPRESS_forms %>% 
   mutate(value_chr = as.character(value)) %>% 
   summarise(
@@ -122,9 +111,9 @@ py_obj_summary_forms <- EMPRESS_forms %>%
   filter(n_py_object > 0) %>% 
   arrange(desc(n_py_object))
 
-# ----------------------------
+#------------------------------------------------------------
 # 2) Query-ready table of affected rows
-# ----------------------------
+#------------------------------------------------------------
 py_obj_rows_forms <- EMPRESS_forms %>%
   mutate(value_chr = as.character(value)) %>%
   filter(str_detect(value_chr, "^<object object at 0x[0-9a-fA-F]+>$")) %>%
@@ -133,9 +122,9 @@ py_obj_rows_forms <- EMPRESS_forms %>%
     variable_name, value = value_chr
   )
 
-# ----------------------------
+#------------------------------------------------------------
 # 2) Clean forms data from python spill-over
-# ----------------------------
+#------------------------------------------------------------
 EMPRESS_forms <- EMPRESS_forms %>%
   mutate(
     value_chr = stringr::str_squish(as.character(value)),
@@ -148,9 +137,9 @@ EMPRESS_forms <- EMPRESS_forms %>%
   ) %>%
   select(-value_chr)
 
-# ----------------------------
+#------------------------------------------------------------
 # 3) Scan for UUID
-# ----------------------------
+#------------------------------------------------------------
 uuid_obj_summary_forms <- EMPRESS_forms %>% 
   mutate(value_chr = str_squish(as.character(value))) %>% 
   summarise(
@@ -160,9 +149,9 @@ uuid_obj_summary_forms <- EMPRESS_forms %>%
   filter(n_UUID_object > 0) %>% 
   arrange(desc(n_UUID_object))
 
-# ----------------------------
+#------------------------------------------------------------
 # 4) Query-ready table of affected rows
-# ----------------------------
+#------------------------------------------------------------
 uuid_obj_rows_forms <- EMPRESS_forms %>%
   mutate(value_chr = str_squish(as.character(value))) %>%
   filter(UUIDvalidate(value_chr) == TRUE) %>% 
@@ -171,9 +160,9 @@ uuid_obj_rows_forms <- EMPRESS_forms %>%
     variable_name, value = value_chr
   )
 
-# ----------------------------
+#------------------------------------------------------------
 # 5) Clean forms data from python spill-over
-# ----------------------------
+#------------------------------------------------------------
 EMPRESS_forms <- EMPRESS_forms %>%
   mutate(
     value_chr = str_squish(as.character(value)),
@@ -194,7 +183,168 @@ rm(
 )
 ```
 
-### 3.4
+### 3.3 Screening variables subset
+
+```{r}
+#------------------------------------------------------------
+# 1) Preparing screening subset
+#------------------------------------------------------------
+EMPRESS_forms_screening <- EMPRESS_forms %>% 
+  filter( # relevant form_layout and variables
+    form_layout == "empress_domain_screening" & 
+    variable_name %in% c(
+      # Inclusion criteria
+      "age_ge_18",
+      "sepsis",
+      "acutely_critically_ill",
+      "indication_for_empirical_antibiotics",
+      # Exclusion criteria
+      "infection_multiresistent_bacteria",
+      "use_of_valproat",
+      "pregnant",
+      "suspected_cns_infection",
+      "allergic_to_betalactam_antibiotics",
+      "preceding_iv_antibiotics",
+      "co_enrolment_with_empress_not_possible",
+      "informed_content_unobtainable",
+      "coercive_measures")
+  ) %>% 
+  select(
+    observation_id,
+    ssid,
+    responsible_site,
+    form_layout,
+    start_datetime,
+    end_datetime,
+    variable_name,
+    value
+  )
+```
+
+### 3.4 Baseline variables (and baseline-like screening variables) subet
+
+```{r}
+#------------------------------------------------------------
+# 1) Preparing baseline subset
+#------------------------------------------------------------
+EMPRESS_forms_baseline <- EMPRESS_forms %>% 
+  filter(ssid %in% EMPRESS_master_feasibility$ssid) %>%  # enrolled participants only
+  filter( 
+    # baseline-like variables from screening forms
+    (form_layout == "empress_domain_screening" & 
+    variable_name %in% c(
+      "haematological_or_metastatic_cancer",
+      "date_of_birth",
+      "acute_surgical_admission",
+      "use_of_respiratory_support_at_randomisation",
+      "use_of_circulatory_support_at_randomisation",
+      "rrt_within_72h_before_randomisation")) |
+    # baseline variables
+    (form_layout == "empress_baseline" &
+    variable_name %in% c(
+      "ischemic_heart_disease",
+      "diabetes",
+      "chronic_pulmonary_disease",
+      "chronic_liver_disease",
+      "immunosuppression",
+      "organ_transplantation",
+      "chronic_rrt",
+      "sex",
+      "clinical_frailty_scale",
+      "date_of_index_hospital_admission",
+      "department_at_which_the_participant_was_included",
+      "weight",
+      "heigh",
+      "systolic_blood_pressure_lowest",
+      "primary_site_of_infection",
+      "positive_bacterial_culture",
+      "type_of_sample",
+      "type_of_bacteria",
+      "resistance_to_piperacillin_tazobactam",
+      "resistance_to_meropenem",
+      "type_of_respiratory_support",
+      "fio2_before_randomisation",
+      "max_oxygen_flow_at_randomisation",
+      "treatment_with_antibacterial_agent_prior_to_randomisation",
+      "anti_bacterial_agent",
+      "use_of_systemic_corticosteroids_at_randomisation",
+      "arterial_blood_gas_available",
+      "arterial_oxygen_saturation ",
+      "pao2",
+      "peripheral_oxygen_saturation",
+      "lactate_highest",
+      "creatinine_highest",
+      "limitations_of_care"))
+    ) %>%  
+    select(
+    observation_id,
+    ssid,
+    responsible_site,
+    form_layout,
+    start_datetime,
+    end_datetime,
+    variable_name,
+    value
+    )
+```
+
+### 3.5 Dayform subset
+
+```{r}
+#------------------------------------------------------------
+# 1) Preparing dayform subset
+#------------------------------------------------------------
+EMPRESS_forms_dayforms <- EMPRESS_forms %>% 
+  filter(ssid %in% EMPRESS_master_feasibility$ssid) %>%  # enrolled participants only
+  filter( 
+    # baseline form layouts from the export
+    form_layout %in% c(
+      "empress_dayform_1_to_30",
+      "empress_dayform_1_to_90",
+      "empress_dayform_non_trial_site_1_to_30",
+      "empress_dayform_non_trial_site_1_to_90") &
+      variable_name %in% c(
+        # Dayform 1 - 30 on non-trial site
+        "isolation_due_to_resistant_bacteria",
+        "type_of_resistant_bacteria_new",
+        "antibiotic_agent_to_which_the_bacteria_was_resistant",
+        "invasive_mechanical_ventilation",
+        "circulatory_support_min_1h",
+        "any_rrt_this_day",
+        "anaphylactic_shock_piptazo_meropenem",
+        "invasive_fungal_infection",
+        "pseudomembranous_colitis",
+        "toxic_epidermal_necrolysis",
+        
+        # Dayform 1 on trial site dayform
+        "dosing_regimen",
+        
+        # Dayform 1 - 30 on trial site
+        "did_the_patient_receive_at_least_50percent_of_the_prescribed_daily_dose",
+        "reason_for_not_receiving_at_least_50_percent",
+        "use_of_any_another_antibiotic_agent_than_allocated_on_this_day",
+        "other_antibiotic_agent_than_allocated_type_treatment",
+        "other_antibiotic_agent_than_allocated_type_agent",
+        
+        # Dayform 31 - 90 on both trial and non-trial 
+        "invasive_mechanical_ventilation",
+        "circulatory_support_min_1h",
+        "any_rrt_this_day"
+        )
+  ) %>%  
+  select(
+    observation_id,
+    ssid,
+    responsible_site,
+    form_layout,
+    start_datetime,
+    end_datetime,
+    variable_name,
+    value
+  )
+```
+
+### 3.6 
 
 ```{r}
 
