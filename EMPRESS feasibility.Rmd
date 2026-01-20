@@ -288,7 +288,7 @@ EMPRESS_forms_baseline <- EMPRESS_forms %>%
     )
 ```
 
-### 3.5 Dayform subset
+### 3.5 Dayform variables subset
 
 ```{r}
 #------------------------------------------------------------
@@ -344,10 +344,49 @@ EMPRESS_forms_dayforms <- EMPRESS_forms %>%
   )
 ```
 
-### 3.6 
+### 3.6 Followup variables subset
 
 ```{r}
+#------------------------------------------------------------
+# 1) Preparing followup 30/90 days subset
+#------------------------------------------------------------
+EMPRESS_forms_followup <- EMPRESS_forms %>% 
+  filter(ssid %in% EMPRESS_master_feasibility$ssid) %>%  # enrolled participants only
+  filter(form_layout == "empress_30_90_days_followup" &
+         variable_name == "30_90_day_followup") %>% 
+  select(
+    observation_id,
+    ssid,
+    responsible_site,
+    form_layout,
+    start_datetime,
+    end_datetime,
+    variable_name,
+    value)
+```
 
+### 3.7 Combining all subsets
+
+```{r}
+#------------------------------------------------------------
+# 1) Combining the different dataframes for all participants
+#------------------------------------------------------------
+EMPRESS_forms_all <- bind_rows(
+  EMPRESS_forms_screening,
+  EMPRESS_forms_baseline, 
+  EMPRESS_forms_dayforms,
+  EMPRESS_forms_followup
+  )
+```
+
+### 3.8 Enrolled 
+
+```{r}
+#------------------------------------------------------------
+# Subset events on enrolled participants
+#------------------------------------------------------------
+EMPRESS_events_enrol <- EMPRESS_events %>% 
+  filter(ssid %in% EMPRESS_master_feasibility$ssid)
 ```
 
 ## 4.0 Data cleaning
