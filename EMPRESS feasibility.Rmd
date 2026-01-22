@@ -1257,3 +1257,159 @@ rm(first_dayform_1_to_90_long,
 ```{r}
 
 ```
+
+## 5.0 Creation of master set for analysis
+
+```{r}
+EMPRESS_master_feasibility
+```
+
+### 5.1 Addition of feasibility variables
+
+```{r}
+# --------------------------------------------------
+# 1) Create one row per ssid with event indicators + time of death (tod)
+# --------------------------------------------------
+event_flags <- EMPRESS_events %>%
+  mutate(
+    ssid = as.character(ssid),
+    event_type_name = as.character(event_type_name),
+    data_collection_allowed = as.character(data_collection_allowed),
+    timestamp = ymd_hms(timestamp)
+  ) %>%
+  group_by(ssid) %>%
+  summarise(
+    # TRUE if the participant ever died
+    death = any(event_type_name == "death", na.rm = TRUE),
+
+    # Time of death (earliest parsable death timestamp)
+    tod = {
+      death_ts <- timestamp[event_type_name == "death"]
+      if (length(death_ts) == 0 || all(is.na(death_ts))) {
+        as.POSIXct(NA)
+      } else {
+        min(death_ts, na.rm = TRUE)
+      }
+    },
+
+    # TRUE if the participant ever withdrew consent
+    withdrawn_consent_empress = any(
+      event_type_name == "withdrawn_consent_empress",
+      na.rm = TRUE
+    ),
+
+    # NA-aware data collection flag
+    data_collection_allowed = {
+      dca <- data_collection_allowed[event_type_name == "withdrawn_consent_empress"]
+
+      if (length(dca) == 0) {
+        FALSE                         # no withdrawal → not allowed
+      } else if (any(dca == "yes", na.rm = TRUE)) {
+        TRUE                          # at least one explicit YES
+      } else if (all(is.na(dca))) {
+        NA                            # withdrawal but only NA info
+      } else {
+        FALSE                         # explicit NO (possibly mixed with NA)
+      }
+    },
+
+    .groups = "drop"
+  )
+
+# --------------------------------------------------
+# 2) Join indicators to feasibility master
+# --------------------------------------------------
+EMPRESS_master_feasibility <- EMPRESS_master_feasibility %>%
+  mutate(ssid = as.character(ssid)) %>%
+  left_join(event_flags, by = "ssid") %>%
+  mutate(
+    death = coalesce(death, FALSE),
+    withdrawn_consent_empress = coalesce(withdrawn_consent_empress, FALSE)
+    # NOTE: data_collection_allowed is intentionally NOT coalesced
+  )
+
+
+```
+
+```{r}
+# --------------------------------------------------
+# 3) Add treatment allocation 
+# --------------------------------------------------
+EMPRESS_forms_allocation <- EMPRESS_forms %>%
+  left_join(
+    EMPRESS_allocation %>%
+      select(ssid, allocated_arm),
+    by = "ssid"
+  )
+```
+
+```{r}
+# --------------------------------------------------
+# 4) Identify protocol violations at the row level
+# --------------------------------------------------
+participants_with_violation <- EMPRESS_forms_allocation %>%
+  # Only rows that could possibly generate a violation
+  filter(
+    value %in% c("By error", "Other reason(s)") |
+      (variable_name == "other_antibiotic_agent_than_allocated_type_agent" &
+         !is.na(value) & value != "")
+  ) %>%
+  mutate(
+    # Rule 1: explicit protocol deviation reason
+    v_reason = value %in% c("By error", "Other reason(s)"),
+
+    # Rule 2: non-allocated antibiotic used (string matching; handles multi-values)
+    v_nonallocated =
+      (allocated_arm == "meropenem" &
+         str_detect(value, fixed("Beta-lactam/beta-lactamase inhibitor", ignore_case = TRUE))) |
+      (allocated_arm == "piperacillin/tazobactam" &
+         str_detect(value, fixed("Carbapenem (e.g., meropenem)", ignore_case = TRUE))),
+
+    protocol_violation_row = v_reason | v_nonallocated
+  ) %>%
+  distinct(ssid, observation_id, .keep_all = TRUE) %>%
+  group_by(ssid) %>%
+  summarise(
+    protocol_violation = any(protocol_violation_row, na.rm = TRUE),
+    protocol_violation_n = sum(protocol_violation_row %in% TRUE, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # --------------------------------------------------
+  # Bring back ALL participants
+  # --------------------------------------------------
+  right_join(
+    EMPRESS_master_feasibility %>% 
+      distinct(ssid, allocated_arm),
+    by = "ssid"
+  ) %>%
+  mutate(
+    protocol_violation   = replace_na(protocol_violation, FALSE),
+    protocol_violation_n = replace_na(protocol_violation_n, 0L),
+    allocation = allocated_arm
+  ) %>%
+  select(ssid, allocation, protocol_violation, protocol_violation_n)
+
+# --------------------------------------------------
+# 6) Join protocol violation status and the dummy allocation to feasibility master
+# --------------------------------------------------
+EMPRESS_master_feasibility <- EMPRESS_master_feasibility %>% 
+  left_join(
+    participants_with_violation %>% 
+      select(ssid, protocol_violation),
+    by = "ssid"
+  )
+
+rm(
+  event_flags, 
+  participants_with_violation, 
+  EMPRESS_forms_allocation
+)
+```
+
+### 5.2 Addition of baseline variables
+
+```{r}
+
+```
+
+### 5.3 Addition of dayform variables
