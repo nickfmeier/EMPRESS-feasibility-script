@@ -1,0 +1,144 @@
+---
+title: "EMPRESS_unblinded_script"
+author: "NM"
+date: "2026-01-26"
+output: html_document
+---
+
+## 1.0 Load libraries
+
+```{r include=FALSE}
+library(tidyverse) 
+library(nanoparquet)
+```
+
+## 2.0 Load data
+
+```{r include=FALSE}
+# -------- Paths to exported data files --------
+data_dir <- "C:/Users/nmei0013/Downloads"
+f_forms <- file.path(data_dir, "export-export_forms_empress_domain_20260127103959.parquet")
+f_events <- file.path(data_dir, "export-export_events_empress_platform_20260127104411.parquet")
+allocation <- file.path(data_dir, "export-export_allocations_empress_domain_20260123110315.parquet")
+
+# -------- Load data from parquet files --------
+EMPRESS_forms <- read_parquet(f_forms)
+EMPRESS_events <- read_parquet(f_events)
+EMPRESS_allocation <- read_parquet(allocation)
+```
+
+## 3.0 Creation of master dataframe for analysis
+
+```{r}
+EMPRESS_master_feasibility <- EMPRESS_events %>%
+  mutate(
+    ssid = as.character(ssid),
+    timestamp = ymd_hms(timestamp)
+  ) %>%
+  filter(str_detect(event_type_name, "enrolment")) %>%
+  group_by(ssid) %>%
+  summarise(
+    rand_datetime_utc = min(timestamp, na.rm = TRUE),
+    enrolment_site    = dplyr::first(enrolment_site),
+    .groups = "drop"
+  ) %>%
+  arrange(rand_datetime_utc) %>%
+  slice_head(n = 200) %>%
+  mutate(rand_datetime_local = with_tz(rand_datetime_utc, "Europe/Copenhagen")) %>%
+  select(ssid, enrolment_site, rand_datetime_utc)
+```
+
+## 3.0 Analysis of protocol violations
+
+```{r}
+# --------------------------------------------------
+# 1) Join indicators to feasibility master
+# --------------------------------------------------
+EMPRESS_master_feasibility <- EMPRESS_master_feasibility %>%
+  mutate(ssid = as.character(ssid)) %>%
+  left_join(event_flags, by = "ssid") %>%
+  mutate(
+    death = coalesce(death, FALSE),
+    withdrawn_consent_empress = coalesce(withdrawn_consent_empress, FALSE)
+    # NOTE: data_collection_allowed intentionally NOT coalesced
+  )
+
+# --------------------------------------------------
+# 3) Add treatment allocation
+# --------------------------------------------------
+EMPRESS_forms_allocation <- EMPRESS_forms %>%
+  left_join(
+    EMPRESS_allocation %>%
+      select(ssid, allocated_arm),
+    by = "ssid"
+  )
+
+EMPRESS_master_feasibility <- EMPRESS_master_feasibility %>%
+  left_join(
+    EMPRESS_allocation %>%
+      select(ssid, allocated_arm),
+    by = "ssid"
+  )
+
+# --------------------------------------------------
+# 4) Identify protocol violations at the row level
+# --------------------------------------------------
+participants_with_violation <- EMPRESS_forms_allocation %>%
+  # Only rows that could possibly generate a violation
+  filter(
+    value %in% c("By error", "Other reason(s)") |
+      (variable_name == "other_antibiotic_agent_than_allocated_type_agent" &
+         !is.na(value) & value != "")
+  ) %>%
+  mutate(
+    # Rule 1: explicit protocol deviation reason
+    v_reason = value %in% c("By error", "Other reason(s)"),
+
+    # Rule 2: non-allocated antibiotic used (string matching; handles multi-values)
+    v_nonallocated =
+      (allocated_arm == "meropenem" &
+         str_detect(value, fixed("Beta-lactam/beta-lactamase inhibitor", ignore_case = TRUE))) |
+      (allocated_arm == "piperacillin/tazobactam" &
+         str_detect(value, fixed("Carbapenem (e.g., meropenem)", ignore_case = TRUE))),
+
+    protocol_violation_row = v_reason | v_nonallocated
+  ) %>%
+  distinct(ssid, observation_id, .keep_all = TRUE) %>%
+  group_by(ssid) %>%
+  summarise(
+    protocol_violation   = any(protocol_violation_row, na.rm = TRUE),
+    protocol_violation_n = sum(protocol_violation_row %in% TRUE, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # --------------------------------------------------
+  # Bring back ALL participants
+  # --------------------------------------------------
+  right_join(
+    EMPRESS_master_feasibility %>%
+      distinct(ssid, allocated_arm),
+    by = "ssid"
+  ) %>%
+  mutate(
+    protocol_violation   = replace_na(protocol_violation, FALSE),
+    protocol_violation_n = replace_na(protocol_violation_n, 0L),
+    allocation = allocated_arm
+  ) %>%
+  select(ssid, allocation, protocol_violation, protocol_violation_n)
+
+# --------------------------------------------------
+# 6) Join protocol violation status
+# --------------------------------------------------
+EMPRESS_master_feasibility <- EMPRESS_master_feasibility %>%
+  left_join(
+    participants_with_violation %>%
+      select(ssid, protocol_violation, protocol_violation_n),
+    by = "ssid"
+  )
+
+rm(
+  event_flags,
+  participants_with_violation,
+  EMPRESS_forms_allocation
+)
+```
+

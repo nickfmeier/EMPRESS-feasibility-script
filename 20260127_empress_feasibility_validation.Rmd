@@ -1,0 +1,1890 @@
+---
+title: "EMPRESS feasibility script"
+author: "NM"
+date: "2026-01-15"
+output: html_document
+---
+
+## 1.0 Load libraries 
+
+```{r include=FALSE}
+library(nanoparquet)
+library(tidyverse)
+library(openxlsx)
+library(stringi)
+library(janitor)
+library(uuid)
+```
+
+## 2.0 Load data
+
+```{r include=FALSE}
+# -------- Paths to exported data files --------
+data_dir <- "C:/Users/nmei0013/Downloads"
+f_forms <- file.path(data_dir, "export-export_forms_empress_domain_20260127103959.parquet")
+f_events <- file.path(data_dir, "export-export_events_empress_platform_20260127104411.parquet")
+allocation <- file.path(data_dir, "export-export_allocations_empress_domain_20260123110315.parquet")
+
+# -------- Load data from parquet files --------
+EMPRESS_forms <- read_parquet(f_forms)
+EMPRESS_events <- read_parquet(f_events)
+EMPRESS_allocation <- read_parquet(allocation)
+```
+
+## 3.0 Data preparation
+
+### 3.1 Creation of master DF
+
+#### 3.x Code for safety report including cut off
+
+```{r eval=FALSE, include=FALSE}
+#------------------------------------------------------------
+# 1) Cutoff date
+#------------------------------------------------------------
+Safety_trigger_date <- date("2026-02-18")
+cuttoff_date <- Safety_trigger_date - days(105) + 1
+
+#------------------------------------------------------------
+# 2) Subset of enrolled participants in EMPRESS <= cuttoff_date
+#------------------------------------------------------------
+EMPRESS_master_safety <- EMPRESS_events %>% 
+  filter(
+      event_type_name == "enrolment" &
+      event_description == "empress_platform" &
+      
+    # Local datetime for enrolment before cuttoff date
+      date(with_tz(timestamp, "Europe/Copenhagen")) <= cuttoff_date 
+  ) %>% 
+  
+  # Rename timestamp to rand_datetime_utc
+  rename(
+    rand_datetime_utc = timestamp,
+         ) %>% 
+  
+  # Keep only relevant colums
+  select(ssid, enrolment_site, rand_datetime_utc)
+```
+
+#### 3.1.1 Creation of master dataframe consisting of 200 first enrolled (feasibility)
+
+```{r}
+EMPRESS_master_feasibility <- EMPRESS_events %>%
+  mutate(
+    ssid = as.character(ssid),
+    timestamp = ymd_hms(timestamp)
+  ) %>%
+  filter(str_detect(event_type_name, "enrolment")) %>%
+  group_by(ssid) %>%
+  summarise(
+    rand_datetime_utc = min(timestamp, na.rm = TRUE),
+    enrolment_site    = dplyr::first(enrolment_site),
+    .groups = "drop"
+  ) %>%
+  arrange(rand_datetime_utc) %>%
+  slice_head(n = 200) %>%
+  mutate(rand_datetime_local = with_tz(rand_datetime_utc, "Europe/Copenhagen")) %>%
+  select(ssid, enrolment_site, rand_datetime_utc)
+```
+
+### 3.2 Screening for unwanted values
+
+#### 3.2.1 Python spillover
+
+```{r}
+#------------------------------------------------------------
+# 1) Scan for Pyhton spill-over
+#------------------------------------------------------------
+py_obj_summary_forms <- EMPRESS_forms %>% 
+  mutate(value_chr = as.character(value)) %>% 
+  summarise(
+    n_py_object = sum(str_detect(value_chr, "<object\\s"), na.rm = TRUE),
+    .by = variable_name
+  ) %>% 
+  filter(n_py_object > 0) %>% 
+  arrange(desc(n_py_object))
+
+#------------------------------------------------------------
+# 2) Query-ready table of affected rows
+#------------------------------------------------------------
+py_obj_rows_forms <- EMPRESS_forms %>%
+  mutate(value_chr = as.character(value)) %>%
+  filter(str_detect(value_chr, "^<object object at 0x[0-9a-fA-F]+>$")) %>%
+  transmute(
+    ssid, responsible_site, form_layout, start_datetime, end_datetime,
+    variable_name, value = value_chr
+  )
+
+#------------------------------------------------------------
+# 2) Clean forms data from python spill-over
+#------------------------------------------------------------
+EMPRESS_forms <- EMPRESS_forms %>%
+  mutate(
+    value_chr = stringr::str_squish(as.character(value)),
+    value_chr = dplyr::if_else(
+      stringr::str_detect(value_chr, "^<object object at 0x[0-9a-fA-F]+>$"),
+      NA_character_,
+      value_chr
+    ),
+    value = value_chr
+  ) %>%
+  select(-value_chr)
+
+```
+
+#### 3.2.2 UUID
+
+```{r}
+#------------------------------------------------------------
+# 3) Scan for UUID
+#------------------------------------------------------------
+uuid_obj_summary_forms <- EMPRESS_forms %>% 
+  mutate(value_chr = str_squish(as.character(value))) %>% 
+  summarise(
+    n_UUID_object = sum(UUIDvalidate(value_chr), na.rm = TRUE),
+    .by = variable_name
+  ) %>% 
+  filter(n_UUID_object > 0) %>% 
+  arrange(desc(n_UUID_object))
+
+#------------------------------------------------------------
+# 4) Query-ready table of affected rows
+#------------------------------------------------------------
+uuid_obj_rows_forms <- EMPRESS_forms %>%
+  mutate(value_chr = str_squish(as.character(value))) %>%
+  filter(UUIDvalidate(value_chr) == TRUE) %>% 
+  transmute(
+    ssid, responsible_site, form_layout, start_datetime, end_datetime,
+    variable_name, value = value_chr
+  )
+
+#------------------------------------------------------------
+# 5) Clean forms data from python spill-over
+#------------------------------------------------------------
+EMPRESS_forms <- EMPRESS_forms %>%
+  mutate(
+    value_chr = str_squish(as.character(value)),
+    value_chr = if_else(
+      UUIDvalidate(value_chr) == TRUE, 
+      NA_character_,
+      value_chr
+    ),
+    value = value_chr
+  ) %>%
+  select(-value_chr)
+
+rm(
+  py_obj_rows_forms,
+  py_obj_summary_forms,
+  uuid_obj_rows_forms,
+  uuid_obj_summary_forms
+)
+```
+
+### 3.3 Subsetting relevant variables within forms
+
+#### 3.3.1 Screening variable subset
+
+```{r}
+#------------------------------------------------------------
+# 1) Preparing screening subset
+#------------------------------------------------------------
+EMPRESS_forms_screening <- EMPRESS_forms %>% 
+  filter( # relevant form_layout and variables
+    form_layout == "empress_domain_screening" & 
+    variable_name %in% c(
+      # Inclusion criteria
+      "age_ge_18",
+      "sepsis",
+      "indication_for_empirical_antibiotics",
+      "acutely_critically_ill",
+      # Exclusion criteria
+      "infection_multiresistent_bacteria",
+      "use_of_valproat",
+      "pregnant",
+      "suspected_cns_infection",
+      "allergic_to_betalactam_antibiotics",
+      "preceding_iv_antibiotics",
+      "co_enrolment_with_empress_not_possible",
+      "informed_content_unobtainable",
+      "coercive_measures")
+  ) %>% 
+  select(
+    observation_id,
+    ssid,
+    responsible_site,
+    form_layout,
+    start_datetime,
+    end_datetime,
+    variable_name,
+    value
+  )
+```
+
+#### 3.3.2 Baseline variables (and baseline-like screening variables) subet
+
+```{r}
+#------------------------------------------------------------
+# 1) Preparing baseline subset
+#------------------------------------------------------------
+EMPRESS_forms_baseline <- EMPRESS_forms %>% 
+  filter(ssid %in% EMPRESS_master_feasibility$ssid) %>%  # enrolled participants only
+  filter( 
+    # baseline-like variables from screening forms
+    (form_layout == "empress_domain_screening" & 
+    variable_name %in% c(
+      "haematological_or_metastatic_cancer",
+      "date_of_birth",
+      "acute_surgical_admission",
+      "use_of_respiratory_support_at_randomisation",
+      "use_of_circulatory_support_at_randomisation",
+      "rrt_within_72h_before_randomisation")) |
+    # baseline variables
+    (form_layout == "empress_baseline" &
+    variable_name %in% c(
+      "ischemic_heart_disease",
+      "diabetes",
+      "chronic_pulmonary_disease",
+      "chronic_liver_disease",
+      "immunosuppression",
+      "organ_transplantation",
+      "chronic_rrt",
+      "sex",
+      "clinical_frailty_scale",
+      "date_of_index_hospital_admission",
+      "department_at_which_the_participant_was_included",
+      "weight",
+      "heigh",
+      "systolic_blood_pressure_lowest",
+      "primary_site_of_infection",
+      "positive_bacterial_culture",
+      "type_of_sample",
+      "type_of_bacteria",
+      "resistance_to_piperacillin_tazobactam",
+      "resistance_to_meropenem",
+      "use_of_respiratory_support_at_randomisation",
+      "type_of_respiratory_support",
+      "fio2_before_randomisation",
+      "max_oxygen_flow_at_randomisation",
+      "treatment_with_antibacterial_agent_prior_to_randomisation",
+      "anti_bacterial_agent",
+      "use_of_systemic_corticosteroids_at_randomisation",
+      "arterial_blood_gas_available",
+      "arterial_oxygen_saturation ",
+      "pao2",
+      "peripheral_oxygen_saturation",
+      "lactate_highest",
+      "creatinine_highest",
+      "limitations_of_care"))
+    ) %>%  
+    select(
+    observation_id,
+    ssid,
+    responsible_site,
+    form_layout,
+    start_datetime,
+    end_datetime,
+    variable_name,
+    value
+    )
+```
+
+#### 3.3.3 Dayform variables subset
+
+```{r}
+#------------------------------------------------------------
+# 1) Preparing dayform subset
+#------------------------------------------------------------
+EMPRESS_forms_dayforms <- EMPRESS_forms %>% 
+  filter(ssid %in% EMPRESS_master_feasibility$ssid) %>%  # enrolled participants only
+  filter( 
+    # baseline form layouts from the export
+    form_layout %in% c(
+      "empress_dayform_1_to_30",
+      "empress_dayform_1_to_90",
+      "empress_dayform_non_trial_site_1_to_30",
+      "empress_dayform_non_trial_site_1_to_90") &
+      variable_name %in% c(
+        # Dayform 1 - 30 on both trial and non-trial site
+        "isolation_due_to_resistant_bacteria",
+        "type_of_resistant_bacteria_new",
+        "antibiotic_agent_to_which_the_bacteria_was_resistant",
+        "invasive_mechanical_ventilation",
+        "circulatory_support_min_1h",
+        "any_rrt_this_day",
+        "anaphylactic_shock_piptazo_meropenem",
+        "invasive_fungal_infection",
+        "pseudomembranous_colitis",
+        "toxic_epidermal_necrolysis",
+        
+        # Dayform 1 on trial site dayform
+        "dosing_regimen",
+        
+        # Dayform 1 - 30 on trial site
+        "did_the_patient_receive_at_least_50percent_of_the_prescribed_daily_dose",
+        "reason_for_not_receiving_at_least_50_percent",
+        "use_of_any_another_antibiotic_agent_than_allocated_on_this_day",
+        "other_antibiotic_agent_than_allocated_type_treatment",
+        "other_antibiotic_agent_than_allocated_type_agent",
+        
+        # Dayform 31 - 90 on both trial and non-trial site
+        "invasive_mechanical_ventilation",
+        "circulatory_support_min_1h",
+        "any_rrt_this_day"
+        )
+  ) %>%  
+  select(
+    observation_id,
+    ssid,
+    responsible_site,
+    form_layout,
+    start_datetime,
+    end_datetime,
+    variable_name,
+    value
+  )
+```
+
+#### 3.3.4 Followup variables subset
+
+```{r}
+#------------------------------------------------------------
+# 1) Preparing followup 30/90 days subset
+#------------------------------------------------------------
+EMPRESS_forms_followup <- EMPRESS_forms %>% 
+  filter(ssid %in% EMPRESS_master_feasibility$ssid) %>%  # enrolled participants only
+  filter(form_layout == "empress_30_90_days_followup" &
+         variable_name == "30_90_day_followup") %>% 
+  select(
+    observation_id,
+    ssid,
+    responsible_site,
+    form_layout,
+    start_datetime,
+    end_datetime,
+    variable_name,
+    value)
+```
+
+#### 3.3.5 Combining all subsets
+
+```{r}
+#------------------------------------------------------------
+# 1) Combining the different dataframes for all participants
+#------------------------------------------------------------
+EMPRESS_forms_all <- bind_rows(
+  EMPRESS_forms_screening,
+  EMPRESS_forms_baseline, 
+  EMPRESS_forms_dayforms,
+  EMPRESS_forms_followup
+  )
+```
+
+#### 3.3.6 Enrolled events
+
+```{r}
+#------------------------------------------------------------
+# 1) Subset events on enrolled participants
+#------------------------------------------------------------
+EMPRESS_events_enrol <- EMPRESS_events %>% 
+  filter(ssid %in% EMPRESS_master_feasibility$ssid) %>%
+  mutate(source = "empress_events")
+ 
+#------------------------------------------------------------
+# 2) All events
+#    - Creating responsible site for events
+#------------------------------------------------------------
+events_master_enrol <- EMPRESS_events_enrol %>% 
+  mutate(
+    responsible_site = case_when(
+      event_type_name == "enrolment" ~ str_squish(as.character(enrolment_site)),
+      event_type_name == "relocate"  ~ str_to_lower(str_squish(str_extract(as.character(event_description), "^[^/]+"))),
+      TRUE ~ NA_character_
+    )
+  ) %>% 
+  group_by(ssid) %>%
+  arrange(desc(enrolment_site), timestamp, .by_group = TRUE) %>%
+  fill(responsible_site, .direction = "down") %>%
+  ungroup() %>% 
+  select(-enrolment_site)
+
+rm(
+  EMPRESS_events_enrol
+)
+```
+
+## 4.0 Data validation
+
+### 4.1 Helper keys
+
+```{r}
+# Helper 1: detect missing 
+na_blank <- function(x) {
+  x <- str_squish(as.character(x))
+  x[x %in% c("", "NA", "NaN", "None", "na", "none", "nan")] <- NA_character_
+  x
+}
+
+# Helper 2: to numeric
+to_numeric <- function(x) {
+
+  if (is.numeric(x)) return(x)
+
+  x_chr <- str_to_lower(str_squish(as.character(x)))
+
+  # Explicit missing encodings
+  x_chr[x_chr %in% c("", "NA", "NaN", "None", "na", "none", "nan")] <- NA_character_
+
+  # Allow signed numeric values (incl. negatives)
+  is_num <- stringr::str_detect(
+    x_chr,
+    "^[-+]?[0-9]*\\.?[0-9]+$"
+  )
+  is_num[is.na(is_num)] <- FALSE
+
+  out <- rep(NA_real_, length(x_chr))
+  out[is_num] <- as.numeric(x_chr[is_num])
+
+  out
+}
+
+# Helper 3
+to_bool <- function(x) {
+  x <- tolower(trimws(as.character(x)))
+  dplyr::case_when(
+    x %in% c("true","t","1","yes","y")  ~ TRUE,
+    x %in% c("false","f","0","no","n")  ~ FALSE,
+    TRUE ~ NA
+  )
+}
+```
+
+### 4.2 General validation
+
+#### 4.2.1 Dayform data range issues
+
+```{r}
+# -------------------------------------------------
+# 1) Randomisation key 
+#    - convert to local time [Make generic]
+#    - account for 6 hours offset [Make generic]
+# -------------------------------------------------
+rand_key <- EMPRESS_master_feasibility %>% 
+  transmute(
+    ssid = as.character(ssid),
+    rand_datetime_utc,
+    rand_datetime_local = with_tz(rand_datetime_utc, "Europe/Copenhagen"), 
+    rand_day_key_local = date(rand_datetime_local - dhours(6))
+  )
+
+# -------------------------------------------------
+# 2) Build function: Collapse dayforms 
+#    - Create horizon_days (30 / 90)
+#    - Expected site type (trial / non_trial)
+#            
+#    + Collapse dayforms
+# -------------------------------------------------
+
+# Build function
+collapse_dayforms <- function(df) {
+
+  dayform_layouts <- c(
+      "empress_dayform_1_to_30",
+      "empress_dayform_1_to_90",
+      "empress_dayform_non_trial_site_1_to_30",
+      "empress_dayform_non_trial_site_1_to_90"
+  )
+
+  df %>%
+    filter(form_layout %in% dayform_layouts) %>%
+    mutate(
+      ssid = as.character(ssid),
+      form_layout = as.character(form_layout),
+      start_datetime = ymd_hms(start_datetime, tz = "UTC", quiet = TRUE),
+      end_datetime   = ymd_hms(end_datetime,   tz = "UTC", quiet = TRUE)
+    ) %>%
+    filter(!is.na(start_datetime), !is.na(end_datetime)) %>%
+    group_by(ssid, form_layout, start_datetime, end_datetime) %>%
+    summarise(
+      responsible_site = first(as.character(responsible_site)),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      horizon_days = case_when(
+        str_detect(form_layout, "(^|_)1(_to)?_30$") ~ 29L, # rand_day = first day
+        str_detect(form_layout, "(^|_)1(_to)?_90$") ~ 89L, 
+        TRUE ~ NA_integer_
+      ),
+      expected_site_type = case_when(
+        form_layout %in% c("empress_dayform_1_to_30",
+                           "empress_dayform_1_to_90") ~ "trial",
+        form_layout %in% c("empress_dayform_non_trial_site_1_to_30",
+                           "empress_dayform_non_trial_site_1_to_90") ~ "non_trial",
+        TRUE ~ NA_character_
+      )
+    )
+}
+
+# Collapse dayforms 
+dayforms_collapsed <- collapse_dayforms(EMPRESS_forms_all)
+
+# ------------------------------------------------------------
+# 3) Build function: Parse relocation destination from event_description
+#    + Parse relocate destionations 
+# ------------------------------------------------------------
+parse_reloc_dest <- function(x) {
+  desc <- str_squish(str_to_lower(as.character(x)))
+
+  # keep only the part after "/" if present; otherwise use full string
+  suffix <- if_else(str_detect(desc, "/"),
+                    str_squish(str_replace(desc, "^.*?/\\s*", "")),
+                    desc)
+
+  case_when(
+    str_detect(suffix, "^out\\s*of\\s*hospital$") ~ "out_of_hospital",
+    str_detect(suffix, "^non\\s*[-]?\\s*trial\\s*site$") ~ "non_trial",
+    str_detect(suffix, "^trial\\s*site$") ~ "trial",
+    TRUE ~ NA_character_
+  )
+}
+
+# Parse relocation destinations 
+events_with_relocation_dest <- events_master_enrol %>% 
+  mutate(
+    reloc_dest = if_else(event_type_name == "relocate", 
+                         parse_reloc_dest(event_description), 
+                         NA_character_),
+    timestamp = ymd_hms(timestamp, tz = "UTC", quiet = TRUE)
+  )
+
+# ------------------------------------------------------------
+# 4) Function: build state intervals  per ssid (trial/nontrial/out_of_hospital),   #    anchored at randomisation
+#    + Create state intervals  
+# ------------------------------------------------------------
+build_state_intervals <- function(events_df, rand_df) {
+# - initial state: trial from rand_time to next relocate/death/horizon (trunc later)
+# - each relocate starts a new state at its timestamp 
+# - end at next relocate timestamp; death will be applied as censor later
+
+  # death times
+  death <- events_df %>%
+    filter(event_type_name == "death") %>%
+    summarise(
+      death_time = suppressWarnings(min(timestamp, na.rm = TRUE)),
+      .by = ssid
+    )
+
+  reloc <- events_df %>%
+    filter(event_type_name == "relocate") %>%
+    filter(!is.na(reloc_dest)) %>%
+    arrange(ssid, timestamp) %>%
+    select(ssid, event_id, timestamp, reloc_dest, event_description)
+
+  # Create per-ssid event stream starting at randomisation with implicit "trial"
+  base <- rand_df %>%
+    transmute(
+      ssid = as.character(ssid),
+      rand_time = ymd_hms(rand_datetime_utc, tz = "UTC", quiet = TRUE)
+    ) %>%
+    filter(!is.na(rand_time))
+
+  # Build intervals:
+  # - initial state: trial from rand_time to next relocate/death/horizon (trunc later)
+  # - each relocate starts a new state at its timestamp
+  # - end at next relocate timestamp; death will be applied as censor later
+  state_points <- bind_rows(
+    base %>% transmute(ssid, point_time = rand_time, state = "trial", source = "rand", event_id = NA_character_),
+    reloc %>% transmute(ssid, point_time = timestamp, state = reloc_dest, source = "relocate", event_id = as.character(event_id))
+  ) %>%
+    arrange(ssid, point_time)
+
+  intervals <- state_points %>%
+    group_by(ssid) %>%
+    mutate(
+      interval_start = point_time,
+      interval_end = lead(point_time),
+      interval_state = state,
+      interval_event_id = event_id,
+      interval_source = source
+    ) %>%
+    ungroup() %>%
+    select(ssid, interval_start, interval_end, interval_state, interval_event_id, interval_source)
+
+  # If interval_end is NA (last known state), keep open-ended; will be truncated by horizon/death later
+  intervals %>%
+    left_join(death, by = "ssid") %>%
+    left_join(base %>% select(ssid, rand_time), by = "ssid")
+}
+
+state_intervals <- build_state_intervals(events_with_relocation_dest, rand_key) %>%
+  left_join(
+    rand_key %>% 
+      select(
+        ssid,
+        rand_day_key_local
+      ),
+    by = "ssid"
+      )
+
+# ------------------------------------------------------------
+# 5) Derive admitted intervals per horizon (30/90) AND site type
+# ------------------------------------------------------------
+make_admitted_intervals <- function(state_int, horizon_days) {
+
+  state_int %>%
+    mutate(
+      last_day_key_local = rand_day_key_local + days(horizon_days),
+
+      # Explicit local timestamp at 05:59:59
+      horizon_end_local = ymd_hms(
+        paste0(last_day_key_local + days(1), " 05:59:59"),
+        tz = "Europe/Copenhagen",
+        quiet = TRUE
+      ),
+      horizon_end = with_tz(horizon_end_local, "UTC"),
+
+      raw_end    = coalesce(interval_end, horizon_end),
+      cens_end_h = pmin(raw_end, horizon_end, na.rm = TRUE),
+      cens_end   = if_else(!is.na(death_time),
+                           pmin(cens_end_h, death_time, na.rm = TRUE),
+                           cens_end_h),
+
+      admitted = interval_state %in% c("trial", "non_trial"),
+
+      ended_by = case_when(
+        !is.na(death_time)    & cens_end == death_time   ~ "death",
+        !is.na(interval_end)  & cens_end == interval_end ~ "relocate",
+        cens_end == horizon_end                           ~ "horizon",
+        TRUE                                             ~ "other"
+      )
+    ) %>%
+    filter(admitted) %>%
+    mutate(
+      adm_start = pmax(interval_start, rand_time, na.rm = TRUE),
+      adm_end   = cens_end
+    ) %>%
+    filter(!is.na(adm_start), !is.na(adm_end), adm_end > adm_start) %>%
+    transmute(
+      ssid,
+      horizon_days = horizon_days,
+      site_type = interval_state,
+      adm_start,
+      adm_end,
+      ended_by,
+      horizon_end
+    )
+}
+
+admitted_30 <- make_admitted_intervals(state_intervals, 29)
+admitted_90 <- make_admitted_intervals(state_intervals, 89)
+admitted_all <- bind_rows(admitted_30, admitted_90)
+
+# ------------------------------------------------------------
+# 5) Check each collapsed dayform is fully contained in an admitted interval
+# ------------------------------------------------------------
+is_contained_in_any_interval <- function(start, end, int_start, int_end) {
+  any(start >= int_start & end <= (int_end + seconds(1))) 
+}
+
+dayform_admission_check <- dayforms_collapsed %>%
+  left_join(rand_key %>% transmute(
+    ssid,
+    rand_time = ymd_hms(rand_datetime_utc, tz = "UTC", quiet = TRUE)),
+            by = "ssid") %>%
+  # attach relevant admitted intervals as list-column
+  left_join(
+    admitted_all %>%
+      group_by(ssid, horizon_days, site_type) %>%
+      summarise(intervals = list(pick(everything())), .groups = "drop"),
+    by = c("ssid" = "ssid",
+           "horizon_days" = "horizon_days",
+           "expected_site_type" = "site_type")
+  ) %>%
+  mutate(
+    has_interval_info = !map_lgl(intervals, is.null),
+    within_admitted_period = pmap_lgl(
+      list(start_datetime, end_datetime, intervals),
+      function(st, en, ints) {
+        if (is.null(ints) || nrow(ints) == 0) return(FALSE)
+        is_contained_in_any_interval(st, en, ints$adm_start, ints$adm_end)
+      }
+    ),
+    issue = case_when(
+      !has_interval_info ~ "no_admitted_intervals_for_expected_site_type",
+      !within_admitted_period ~ "dayform_outside_admitted_period",
+      TRUE ~ NA_character_
+    )
+  ) %>%
+  filter(!is.na(issue)) %>%
+  transmute(
+    ssid,
+    form_layout,
+    expected_site_type,
+    horizon_days,
+    start_datetime,
+    end_datetime,
+    responsible_site,
+    issue
+  ) %>%
+  arrange(ssid, start_datetime)
+
+# ==================================================
+# DEBUG: Dayforms occurring outside admitted intervals
+# --------------------------------------------------
+# What this section does:
+#   1) Attach admitted intervals (adm_start / adm_end) as a list-column
+#      to each collapsed dayform record
+#   2) Evaluate interval containment using a row-wise pmap check
+#   3) Keep only problematic dayforms (outside all admitted intervals)
+#   4) Convert timestamps to local time for human-readable inspection
+#   5) Extract one example case (ssid + horizon + site type) for deep dive
+# ==================================================
+# Re-create a debug table keeping the admission intervals as a list-column
+debug_tbl <- dayforms_collapsed %>%
+  left_join(
+    admitted_all %>%
+      # Group admitted intervals per patient, horizon, and site type
+      group_by(ssid, horizon_days, site_type) %>%
+      summarise(
+        intervals = list(dplyr::pick(everything())),
+        .groups = "drop"
+      ),
+    by = c(
+      "ssid" = "ssid",
+      "horizon_days" = "horizon_days",
+      "expected_site_type" = "site_type"
+    )
+  ) %>%
+  mutate(
+    # Check whether the dayform interval is fully contained
+    # within ANY admitted interval
+    within = purrr::pmap_lgl(
+      list(start_datetime, end_datetime, intervals),
+      function(st, en, ints) {
+        if (is.null(ints) || nrow(ints) == 0) return(FALSE)
+        any(st >= ints$adm_start & en <= ints$adm_end)
+      }
+    )
+  ) %>%
+  # Keep only dayforms outside admitted periods
+  filter(!within) %>%
+  # Convert to local time for easier manual inspection
+  mutate(
+    start_local = with_tz(start_datetime, "Europe/Copenhagen"),
+    end_local   = with_tz(end_datetime, "Europe/Copenhagen")
+  )
+
+debug_tbl
+
+# --------------------------------------------------
+# Inspect a single problematic case in detail
+# --------------------------------------------------
+problem_ssid <- debug_tbl$ssid[1]
+problem_h    <- debug_tbl$horizon_days[1]
+problem_type <- debug_tbl$expected_site_type[1]
+
+admitted_all %>%
+  filter(
+    ssid == problem_ssid,
+    horizon_days == problem_h,
+    site_type == problem_type
+  ) %>%
+  mutate(
+    adm_start_local = with_tz(adm_start, "Europe/Copenhagen"),
+    adm_end_local   = with_tz(adm_end, "Europe/Copenhagen")
+  ) %>%
+  arrange(adm_start) %>%
+  select(
+    ssid,
+    horizon_days,
+    site_type,
+    adm_start_local,
+    adm_end_local,
+    ended_by,
+    interval_end = adm_end,
+    horizon_end
+  )
+```
+
+#### 4.2.2 Overlapping trial and non-trial dayforms
+
+Check for overlapping trial- and non-trial dayforms. None expected.
+
+```{r}
+# -------------------------------------------------
+# 1) Function: Overlaps detection + counts (n overlaps per ssid)
+# -------------------------------------------------
+count_overlaps <- function(trial_df, nontrial_df, inclusive = TRUE) {
+
+  overlaps <- trial_df %>%
+    inner_join(nontrial_df, by = "ssid", relationship = "many-to-many",
+               suffix = c("_trial", "_nontrial")) %>%
+    mutate(
+      is_overlap = if (inclusive) {
+        (start_datetime_trial <= end_datetime_nontrial) &
+          (start_datetime_nontrial <= end_datetime_trial)
+      } else {
+        (start_datetime_trial <  end_datetime_nontrial) &
+          (start_datetime_nontrial <  end_datetime_trial)
+      },
+      overlap_start = pmax(start_datetime_trial, start_datetime_nontrial),
+      overlap_end   = pmin(end_datetime_trial,   end_datetime_nontrial)
+    ) %>%
+    filter(is_overlap)
+
+  # A) Pairwise table (audit)
+  overlap_pairs <- overlaps %>%
+    transmute(
+      ssid,
+      trial_start = start_datetime_trial,
+      trial_end   = end_datetime_trial,
+      nontrial_start = start_datetime_nontrial,
+      nontrial_end   = end_datetime_nontrial,
+      overlap_start, 
+      overlap_end
+    ) %>%
+    arrange(ssid, overlap_start)
+
+  # B) Counts per ssid (validation signal)
+  overlap_counts <- overlap_pairs %>%
+    summarise(
+      n_overlapping_pairs = n(),
+      .by = ssid
+    ) %>%
+    arrange(desc(n_overlapping_pairs))
+
+  list(
+    overlap_pairs = overlap_pairs, 
+    overlap_counts = overlap_counts
+       )
+}
+
+# -------------------------------------------------
+# 2) Run overlap checks on 1–90 and 1–30 dayforms
+#    and extract results into explicit data frames
+# -------------------------------------------------
+# Collapse all four dayform layouts once
+dayforms_collapsed <- collapse_dayforms(EMPRESS_forms_all)
+
+# Subset for each comparison
+trial_1_90 <- dayforms_collapsed %>% 
+  filter(form_layout == "empress_dayform_1_to_90")
+
+nontrial_1_90 <- dayforms_collapsed %>% 
+  filter(form_layout == "empress_dayform_non_trial_site_1_to_90")
+
+trial_1_30 <- dayforms_collapsed %>% 
+  filter(form_layout == "empress_dayform_1_to_30")
+
+nontrial_1_30 <- dayforms_collapsed %>% 
+  filter(form_layout == "empress_dayform_non_trial_site_1_to_30")
+
+# Run overlap checks
+res_1_90 <- count_overlaps(trial_1_90, nontrial_1_90, inclusive = TRUE)
+res_1_30 <- count_overlaps(trial_1_30, nontrial_1_30, inclusive = TRUE)
+
+# -------------------------------------------------
+# 3) Extract outputs into explicit data frames
+# -------------------------------------------------
+# 1–90 dayforms
+df_overlap_counts_1_90 <- res_1_90$overlap_counts %>%
+  mutate(window = "1_to_90")
+
+df_overlap_pairs_1_90 <- res_1_90$overlap_pairs %>%
+  mutate(window = "1_to_90")
+
+# 1–30 dayforms
+df_overlap_counts_1_30 <- res_1_30$overlap_counts %>%
+  mutate(window = "1_to_30")
+
+df_overlap_pairs_1_30 <- res_1_30$overlap_pairs %>%
+  mutate(window = "1_to_30")
+
+# -------------------------------------------------
+# 4) Combine results across windows (optional)
+# -------------------------------------------------
+validation_overlap_counts <- bind_rows(
+  df_overlap_counts_1_90,
+  df_overlap_counts_1_30
+)
+
+validation_overlap_pairs <- bind_rows(
+  df_overlap_pairs_1_90,
+  df_overlap_pairs_1_30
+)
+
+# -------------------------------------------------
+# 5) Cleanup intermediate objects
+# -------------------------------------------------
+
+rm(
+  trial_1_90,
+  nontrial_1_90,
+  trial_1_30,
+  nontrial_1_30,
+  res_1_90,
+  res_1_30,
+  df_overlap_counts_1_90,
+  df_overlap_counts_1_30,
+  df_overlap_pairs_1_90,
+  df_overlap_pairs_1_30,
+  rand_key,
+  dayforms_collapsed,
+  events_with_relocation_dest,
+  state_intervals,
+  admitted_30,
+  admitted_90,
+  admitted_all,
+  dayform_admission_check,
+  debug_tbl,
+  problem_ssid,
+  problem_h,
+  problem_type
+)
+```
+
+### 4.3 Outliers
+
+#### 4.3.1 Outliers by hard/soft boundries
+
+```{r}
+# -------------------------------------------------
+# 1) Define validation rules for baseline and baseline-like variables
+# -------------------------------------------------
+# Hard bounds = impossible/outside absolute physiological or data constraints
+# Soft bounds = clinically implausible (flag for review), but possible
+
+# Define hard/soft boundaries (match easyRF, except highest lactate)
+rules <- tibble::tribble(
+  ~variable, ~hard_lo, ~hard_hi, ~soft_lo, ~soft_hi, ~unit,
+  "weight",  20,  500,  22,  150, "kg",
+  "height", 120,  240, 150,  200, "cm",
+  "systolic_blood_pressure_lowest",  30,  300,  60,  240, "mmHg",
+  "fio2_before_randomisation",        0,    1, 0.21,   1, "fraction",
+  "max_oxygen_flow_at_randomisation", 0,  100,   0,  60, "L/min",
+  "arterial_oxygen_saturation",       0,  100,  70, 100, "%",
+  "peripheral_oxygen_saturation",     0,  100,  70, 100, "%",
+  "pao2",                              0,   40,   4,  20, "kPa",
+  "lactate_highest",                   0,   30, 0.5,  20, "mmol/L",
+  "creatinine_highest",                0, 2000,  30, 1500, "µmol/L")
+
+# -------------------------------------------------
+# 2) Restrict to variables to those present in rules and 
+#    - create raw value for reporting (preserves original)
+#    - create numeric value with missing detected 
+#    - filter on non-missing values
+# -------------------------------------------------
+EMPRESS_forms_numeric <- EMPRESS_forms_all %>% 
+  filter(variable_name %in% rules$variable) %>% 
+  mutate(
+    value_raw = as.character(value),
+    value_num = to_numeric(value_raw)) %>% 
+  filter(!is.na(value_num))
+
+# -------------------------------------------------
+# 3) Join validation rules and apply rules 
+# -------------------------------------------------
+EMPRESS_forms_numeric_validation <- EMPRESS_forms_numeric %>% 
+  inner_join(
+    rules,
+    by = c("variable_name" = "variable")
+  ) %>% mutate(
+    issue_type = case_when(
+      value_num < hard_lo | value_num > hard_hi ~ "hard_outlier",
+      value_num < soft_lo | value_num > soft_hi ~ "soft_outlier",
+      TRUE ~ "ok"
+    ),
+    source = form_layout
+  ) 
+
+# -------------------------------------------------
+# 4) Validation report
+#    - Change datetimes to local time [Make generic at some point]
+# -------------------------------------------------
+validation_outliers_boundaries <- EMPRESS_forms_numeric_validation %>% 
+  filter(issue_type %in% c("hard_outlier", "soft_outlier")) %>% 
+  transmute(
+    id = observation_id,
+    ssid,
+    responsible_site,
+    source,
+    time_point = paste0(with_tz(start_datetime, "Europe/Copenhagen"),
+                        " - ",
+                        with_tz(start_datetime, "Europe/Copenhagen")
+                        ),
+    variable_name,
+    value = value_raw,
+    issue_type,
+    note = 
+      case_when(
+      issue_type == "hard_outlier" 
+      ~ paste0("Data validation: outside hard bounds [", hard_lo, ", ", hard_hi, "] ", unit),
+      issue_type == "soft_outlier" 
+      ~ paste0("Data validation: outside soft bounds [", soft_lo, ", ", soft_hi, "] ", unit),
+      TRUE ~ NA_character_
+      )
+    )
+
+rm(
+  rules,
+  EMPRESS_forms_numeric,
+  EMPRESS_forms_numeric_validation
+)
+```
+
+### 4.4 Missing
+
+```{r}
+# -------------------------------------------------
+# 1) Validation report for missing
+# -------------------------------------------------
+validation_missing_values <- EMPRESS_forms_all %>%
+  
+  # Standardise missing  
+  # [As of now, actual confirmed missing (unkowns) and blanks are treated as missing - change if needed. Empty fields in export == not filled]
+  
+  mutate(
+    value_raw = as.character(value),
+    value_std = na_blank(value_raw),
+    source = form_layout
+  ) %>% 
+  
+  # Validation report
+  # - Change datetimes to local time [Make generic at some point]
+  filter(is.na(value_std) | value_std == "Unknown") %>% # [Change if needed]
+  transmute(
+    id = observation_id,
+    ssid,
+    responsible_site,
+    source,
+    time_point = paste0(with_tz(start_datetime, "Europe/Copenhagen"),
+                        " - ",
+                        with_tz(start_datetime, "Europe/Copenhagen")
+                        ),
+    variable_name,
+    value = value_raw,
+    issue_type = "missing_value",
+    note = "Data validation: values missing / not filled in"
+  ) 
+```
+
+### 4.5 Date issues
+
+```{r}
+# -------------------------------------------------
+# 1) Build small anchor table in wide format with observation ids
+# -------------------------------------------------
+# Get form dates
+form_date_vars <- c(
+  "date_of_birth",
+  "date_of_index_hospital_admission"
+)
+
+anchors_date_long <- EMPRESS_forms_all %>%
+  filter(variable_name %in% form_date_vars) %>%
+  transmute(
+    id = observation_id,
+    ssid,
+    responsible_site,
+    source = form_layout,
+    start_datetime,
+    end_datetime,
+    variable_name,
+    value_date = ymd(na_if(trimws(as.character(value)), ""))
+  )
+
+anchors_date_wide <- anchors_date_long %>%
+  select(ssid, responsible_site, variable_name, value_date) %>%
+  pivot_wider(
+    id_cols = c(ssid, responsible_site),
+    names_from = variable_name,
+    values_from = value_date
+  ) %>%
+  left_join(
+    anchors_date_long %>%
+      mutate(var_id = paste0(variable_name, "__id")) %>%
+      select(ssid, responsible_site, var_id, id) %>%
+      pivot_wider(
+        id_cols = c(ssid, responsible_site),
+        names_from = var_id,
+        values_from = id
+      ),
+    by = c("ssid", "responsible_site")
+  )
+
+# Add randomisation time from master (convert to local time)
+anchors <- EMPRESS_master_feasibility %>%
+  transmute(
+    ssid,
+    responsible_site = enrolment_site,
+    rand_time_local = with_tz(rand_datetime_utc, "Europe/Copenhagen"),
+    rand_date = date(rand_time_local)
+  ) %>%
+  left_join(anchors_date_wide, by = c("ssid", "responsible_site"))
+
+# -------------------------------------------------
+# 2) Build canonical event log (EMPRESS) in long format
+# -------------------------------------------------
+empress_keep <- c(
+  "death",
+  "withdrawn_consent_empress",
+  "clinical_decision_empress",
+  "discontinuation_therapy",
+  "involuntary_hospitalisation",
+  "sar_susar",
+  "susar",
+  "consent_from_trial_guardian",
+  "consent_from_relative",
+  "consent_from_participant",
+  "consent_obtained",
+  "relocate")
+
+events <- events_master_enrol %>%
+  filter(event_type_name %in% empress_keep) %>%
+  mutate(
+    event_time_local = with_tz(timestamp, "Europe/Copenhagen"),
+    id = event_id
+  ) %>%
+  select(id, ssid, source, responsible_site, event_type_name, event_time_local)
+
+# -------------------------------------------------
+# 3) Define event groups
+# -------------------------------------------------
+eop_susar_events <- c(
+  "death",
+  "withdrawn_consent",
+  "clinical_decision",
+  "discontinuation_therapy",
+  "involuntary_hospitalisation",
+  "sar_susar",
+  "susar"
+)
+
+relocate_events <- "relocate"
+
+consent_events <- c(
+  "consent_from_trial_guardian",
+  "consent_from_relative",
+  "consent_from_participant",
+  "consent_obtained"
+)
+
+# -------------------------------------------------
+# 4) Validation (set-based)
+# -------------------------------------------------
+events_with_anchor <- events %>%
+  left_join(
+    anchors %>% select(ssid, rand_time_local),
+    by = "ssid"
+  )
+
+# 1) HARD: events before randomisation
+issues_before_rand <- events_with_anchor %>%
+  filter(!is.na(event_time_local), !is.na(rand_time_local)) %>%
+  filter(event_time_local < rand_time_local) %>%
+  transmute(
+    id,
+    ssid,
+    responsible_site,
+    source,
+    time_point = as.character(event_time_local),
+    variable = event_type_name,
+    value = as.character(event_time_local),
+    issue_type = "hard",
+    note = paste0(
+      "Data validation: event time (", event_time_local,
+      ") is before randomisation (", rand_time_local, ")"
+    )
+  )
+
+# 2) HARD: events > 90 days after randomisation
+issues_after_90 <- events_with_anchor %>%
+  filter(!is.na(event_time_local), !is.na(rand_time_local)) %>%
+  filter(event_time_local > rand_time_local + days(90)) %>%
+  transmute(
+    id,
+    ssid,
+    responsible_site,
+    source,
+    time_point = as.character(event_time_local),
+    variable = event_type_name,
+    value = as.character(event_time_local),
+    issue_type = "hard",
+    note = paste0(
+      "Data validation: event time (", event_time_local,
+      ") is > 90 days after randomisation (", rand_time_local, ")"
+    )
+  )
+
+# 3) HARD: events after death
+death_time <- events %>%
+  filter(event_type_name == "death") %>%
+  group_by(ssid) %>%
+  summarise(
+    death_time = min(event_time_local, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+issues_after_death <- events %>%
+  filter(
+    (event_type_name %in% eop_susar_events & event_type_name != "death") |
+      event_type_name == "consent_from_participant"
+  ) %>%
+  left_join(death_time, by = "ssid") %>%
+  filter(!is.na(event_time_local), !is.na(death_time)) %>%
+  filter(event_time_local > death_time) %>%
+  transmute(
+    id,
+    ssid,
+    responsible_site,
+    source,
+    time_point = as.character(event_time_local),
+    variable = event_type_name,
+    value = as.character(event_time_local),
+    issue_type = "hard",
+    note = paste0(
+      "Data validation: event time (", event_time_local,
+      ") is after death time (", death_time, ")"
+    )
+  )
+
+# -------------------------------------------------
+# 5) Baseline validation
+# -------------------------------------------------
+issues_baseline <- anchors %>%
+  rowwise() %>%
+  transmute(
+    ssid,
+    responsible_site,
+    issues = list({
+      out <- tibble(
+        variable = character(),
+        issue_type = character(),
+        value = character(),
+        note = character(),
+        id = character()
+      )
+
+      add_issue <- function(out, variable, issue_type, value, note, id = NA_character_) {
+        bind_rows(
+          out,
+          tibble(
+            variable = variable,
+            issue_type = issue_type,
+            value = as.character(value),
+            note = note,
+            id = as.character(id)
+          )
+        )
+      }
+
+      dob <- date_of_birth
+      hosp <- date_of_index_hospital_admission
+      rdt <- rand_date
+
+      dob_id <- date_of_birth__id
+      hosp_id <- date_of_index_hospital_admission__id
+
+      if (!is.na(dob) && dob > Sys.Date()) {
+        out <- add_issue(out, "date_of_birth", "hard", dob, "Data validation: date of birth is in the future", dob_id)
+      }
+
+      if (!is.na(dob) && !is.na(rdt) && dob > rdt) {
+        out <- add_issue(
+          out, "date_of_birth", "hard", dob,
+          paste0("Data validation: date of birth (", dob, ") is after randomisation date (", rdt, ")"),
+          dob_id
+        )
+      }
+
+      if (!is.na(dob) && !is.na(rdt) && dob <= rdt && interval(dob, rdt) < years(18)) {
+        out <- add_issue(
+          out, "date_of_birth", "hard", dob,
+          paste0("Data validation: age < 18 at randomisation date (", rdt, ")"),
+          dob_id
+        )
+      }
+
+      if (!is.na(hosp) && !is.na(dob) && hosp < dob) {
+        out <- add_issue(
+          out, "date_of_index_hospital_admission", "hard", hosp,
+          paste0("Data validation: index hospital admission (", hosp, ") is before date of birth (", dob, ")"),
+          hosp_id
+        )
+      }
+
+      if (!is.na(hosp) && !is.na(rdt) && hosp > rdt) {
+        out <- add_issue(
+          out, "date_of_index_hospital_admission", "hard", hosp,
+          paste0("Data validation: index hospital admission (", hosp, ") is after randomisation date (", rdt, ")"),
+          hosp_id
+        )
+      }
+
+      if (!is.na(hosp) && !is.na(rdt) && interval(hosp, rdt) > years(1)) {
+        out <- add_issue(
+          out, "date_of_index_hospital_admission", "soft", hosp,
+          paste0("Data validation: index hospital admission (", hosp, ") is > 1 year before randomisation (", rdt, ")"),
+          hosp_id
+        )
+      }
+
+      out
+    })
+  ) %>%
+  ungroup() %>%
+  unnest(issues) %>%
+  filter(!is.na(variable)) %>%
+  left_join(
+    EMPRESS_forms_all %>%
+      transmute(
+        id = observation_id,
+        source = form_layout,
+        time_point = as.character(
+          paste0(
+            with_tz(start_datetime, "Europe/Copenhagen"),
+            " - ",
+            with_tz(end_datetime, "Europe/Copenhagen")
+          )
+        )
+      ),
+    by = "id"
+  ) %>%
+  relocate(id, ssid, responsible_site, source, time_point, variable, value, issue_type, note)
+
+# -------------------------------------------------
+# 6) Validation report
+# -------------------------------------------------
+
+validation_dates <- bind_rows(
+  issues_baseline,
+  issues_before_rand,
+  issues_after_90,
+  issues_after_death
+)
+
+# -------------------------------------------------
+# 7) Cleanup
+# -------------------------------------------------
+
+rm(
+  anchors,
+  anchors_date_long,
+  anchors_date_wide,
+  issues_baseline,
+  death_time,
+  events,
+  events_master_enrol,
+  events_with_anchor,
+  issues_after_90,
+  issues_after_death,
+  issues_before_rand,
+  consent_events,
+  empress_keep,
+  form_date_vars,
+  eop_susar_events
+)
+```
+
+### 4.6 Logical issues
+
+#### 4.6.1 Screening / baseline / dayform logic issues
+
+```{r}
+# -------------------------------------------------
+# 1) Build anchor with relevant baseline / screening vars 
+# -------------------------------------------------
+
+# Get relevant vars
+screening_vars <- c(
+  "use_of_circulatory_support_at_randomisation",
+  "use_of_respiratory_support_at_randomisation",
+  "rrt_within_72h_before_randomisation",
+  "acutely_critically_ill"
+)
+
+baseline_vars <- c(
+  "chronic_rrt",
+  "use_of_respiratory_support_at_randomisation",
+  "type_of_respiratory_support"   # <-- ADD THIS
+)
+
+# Build screening and baseline anchor
+anchor_screening <- EMPRESS_forms_all %>%
+  filter(ssid %in% EMPRESS_master_feasibility$ssid) %>%  # enrolled participants only
+  filter(
+    form_layout == "empress_domain_screening",
+    variable_name %in% screening_vars
+  )
+
+anchor_baseline <- EMPRESS_forms_all %>% 
+  filter(
+    form_layout == "empress_baseline",
+    variable_name %in% baseline_vars
+  )
+
+# -------------------------------------------------
+# 2) Combine anchors while preserving data provenance
+# -------------------------------------------------
+
+anchor <- bind_rows(anchor_screening, anchor_baseline) %>%
+  mutate(
+    ssid = as.character(ssid),
+    enrolment_site = as.character(responsible_site),
+    observation_id = as.character(observation_id),
+    source = case_when(
+      form_layout == "empress_domain_screening" ~ "screening",
+      form_layout == "empress_baseline"         ~ "baseline",
+      TRUE ~ NA_character_
+    ),
+    colname = paste0(source, "__", variable_name)
+  )
+
+# Wide values
+anchor_wide_vals <- anchor %>%
+  select(ssid, enrolment_site, colname, value) %>%
+  pivot_wider(
+    id_cols = c(ssid, enrolment_site),
+    names_from = colname,
+    values_from = value,
+    values_fill = NA_character_
+  )
+
+# Wide observation IDs (suffix columns)
+anchor_wide_ids <- anchor %>%
+  mutate(colname_id = paste0(colname, "__observation_id")) %>%
+  select(ssid, enrolment_site, colname_id, observation_id) %>%
+  pivot_wider(
+    id_cols = c(ssid, enrolment_site),
+    names_from = colname_id,
+    values_from = observation_id,
+    values_fill = NA_character_
+  )
+
+# Combine
+anchor_wide <- anchor_wide_vals %>%
+  left_join(anchor_wide_ids, by = c("ssid", "enrolment_site")) %>%
+  mutate(
+    across(
+      matches("^(screening__|baseline__)") & !ends_with("__observation_id"),
+      ~ dplyr::case_when(
+        .x == "Yes" ~ "TRUE",
+        .x == "No"  ~ "FALSE",
+        TRUE        ~ .x
+      )
+    )
+  )
+```
+
+#### 4.6.2 Critically illness validation
+
+```{r}
+# -------------------------------------------------
+# Rule 1) Critically ill, but is not recieving either respiratory or circulatory support
+# -------------------------------------------------
+issue_critically_illness <- anchor_wide %>%
+  mutate(
+    # If acutely_critically_ill is TRUE, at least one of resp/circ must be TRUE
+    rule_violation =
+      screening__acutely_critically_ill %in% TRUE &
+      !(screening__use_of_respiratory_support_at_randomisation %in% TRUE |
+          screening__use_of_circulatory_support_at_randomisation %in% TRUE)
+  ) %>%
+  filter(rule_violation) %>%
+  transmute(
+    ssid,
+    responsible_site = enrolment_site,
+
+    # keep the obs ids (still useful for drilling down)
+    id_1 = screening__acutely_critically_ill__observation_id,
+    id_2 = screening__use_of_respiratory_support_at_randomisation__observation_id,
+    id_3 = screening__use_of_circulatory_support_at_randomisation__observation_id,
+
+    variable_name = "critically_illness_requires_support",
+    issue_type = "hard",
+    note = paste0(
+      "Data validation: acutely critically ill is TRUE but both supports are FALSE/NA: ",
+      "acutely_critically_ill=", screening__acutely_critically_ill,
+      ", respiratory_support=", screening__use_of_respiratory_support_at_randomisation,
+      ", circulatory_support=", screening__use_of_circulatory_support_at_randomisation,
+      ". At least one support must be TRUE."
+    )
+  )
+
+# Join with anchor to long format report: 
+validation_critically_illness <- issue_critically_illness %>% 
+  transmute(
+    ssid,
+    id = id_1,  # join on the primary observation id (acutely_critically_ill)
+    responsible_site,
+    variable_name,
+    issue_type,
+    note
+  ) %>% 
+  left_join(
+    anchor %>% 
+      transmute(
+        ssid, 
+        responsible_site_anchor = responsible_site,
+        source = form_layout,
+        id = as.character(observation_id),
+        time_point = as.character(lubridate::interval(
+          lubridate::with_tz(start_datetime, "Europe/Copenhagen"),
+          lubridate::with_tz(end_datetime, "Europe/Copenhagen")
+        )),
+        value
+      ),
+    by = c("ssid", "id")
+  ) %>% 
+  # Prefer the site from the anchor row if available
+  mutate(
+    responsible_site = coalesce(responsible_site_anchor, responsible_site)
+  ) %>% 
+  select(-responsible_site_anchor) %>% 
+  relocate(
+    id, ssid, responsible_site, source, time_point, variable_name, value, issue_type, note
+  )
+```
+
+#### 4.6.3 Respiratory support logic check
+
+```{r}
+# -------------------------------------------------
+# 1) Build first trial day (empress_dayform_1_to_90) with observation ids
+# -------------------------------------------------
+day_vars <- c(
+  "invasive_mechanical_ventilation",
+  "circulatory_support_min_1h"
+)
+
+# First trial dayform (1_to_90) - long format, keep FIRST day per ssid
+first_dayform_1_to_90_long <- EMPRESS_forms_all %>% 
+  filter(
+    form_layout == "empress_dayform_1_to_90",
+    variable_name %in% day_vars
+  ) %>% 
+  mutate(
+    ssid = as.character(ssid),
+    value_bool = to_bool(value)
+  ) %>% 
+  arrange(ssid, start_datetime) %>% 
+  group_by(ssid) %>% 
+  filter(start_datetime == first(start_datetime)) %>% 
+  ungroup()
+
+# Pivot values wide (logical)
+first_dayform_vals <- first_dayform_1_to_90_long %>% 
+  select(ssid, responsible_site, start_datetime, end_datetime, variable_name, value_bool) %>% 
+  pivot_wider(
+    id_cols = c(ssid, responsible_site, start_datetime, end_datetime),
+    names_from = variable_name,
+    values_from = value_bool
+  )
+
+# Pivot observation ids wide
+first_dayform_ids <- first_dayform_1_to_90_long %>%
+  mutate(var_id = paste0(variable_name, "__observation_id")) %>%
+  select(ssid, responsible_site, start_datetime, end_datetime, var_id, observation_id) %>%
+  pivot_wider(
+    id_cols = c(ssid, responsible_site, start_datetime, end_datetime),
+    names_from = var_id,
+    values_from = observation_id
+  )
+
+# Merge and standardise names robustly
+first_trial_dayform_1_to_90_wide <- first_dayform_vals %>% 
+  left_join(
+    first_dayform_ids,
+    by = c("ssid", "responsible_site", "start_datetime", "end_datetime")
+  ) %>% 
+  rename(
+    first_instance_mv       = any_of("invasive_mechanical_ventilation"),
+    first_instance_mv_obsid = any_of(c(
+      "invasive_mechanical_ventilation__observation_id",
+      "invasive_mechanical_ventilation__observation_id.x",
+      "invasive_mechanical_ventilation__observation_id.y"
+    )),
+    first_instance_circ       = any_of("circulatory_support_min_1h"),
+    first_instance_circ_obsid = any_of(c(
+      "circulatory_support_min_1h__observation_id",
+      "circulatory_support_min_1h__observation_id.x",
+      "circulatory_support_min_1h__observation_id.y"
+    ))
+  )
+
+# ---------------
+# -------------------------------------------------
+# Rule 2) Anchor / dayform cross validation
+#   A) Screening vs baseline: TRUE/FALSE mismatch
+#   B) Baseline type_of_respiratory_support (IMV) vs Dayform1 MV (TRUE/FALSE)
+# -------------------------------------------------
+
+# =================================================
+# A) Screening vs baseline: TRUE/FALSE mismatch
+# =================================================
+issue_mv_screen_base_mismatch <- anchor_wide %>%
+  mutate(ssid = as.character(ssid)) %>%
+  left_join(
+    first_trial_dayform_1_to_90_wide %>% mutate(ssid = as.character(ssid)),
+    by = "ssid"
+  ) %>%
+  mutate(
+    # mismatch only when both are non-missing and opposite
+    rule_violation =
+      !is.na(screening__use_of_respiratory_support_at_randomisation) &
+      !is.na(baseline__use_of_respiratory_support_at_randomisation) &
+      (screening__use_of_respiratory_support_at_randomisation !=
+         baseline__use_of_respiratory_support_at_randomisation)
+  ) %>%
+  filter(rule_violation) %>%
+  transmute(
+    ssid,
+    responsible_site = enrolment_site,
+
+    # obs ids for drill-down
+    id_1 = screening__use_of_respiratory_support_at_randomisation__observation_id,
+    id_2 = baseline__use_of_respiratory_support_at_randomisation__observation_id,
+
+    variable_name = "screening_vs_baseline_respiratory_support_mismatch",
+    issue_type = "hard",
+    note = paste0(
+      "Data validation: mismatch between the use of respiratory support on the screening- and baseline form:  ",
+      "screening=", screening__use_of_respiratory_support_at_randomisation,
+      ", baseline=", baseline__use_of_respiratory_support_at_randomisation,
+      ". Please check both the screening- and baseline-form values for respiratory support"
+    )
+  )
+
+validation_mv_screen_base_mismatch <- issue_mv_screen_base_mismatch %>%
+  transmute(
+    ssid,
+    id = id_2, # join on screening obs id
+    responsible_site,
+    variable_name,
+    issue_type,
+    note
+  ) %>%
+  left_join(
+    anchor %>%
+      transmute(
+        ssid,
+        responsible_site_anchor = responsible_site,
+        source = form_layout,
+        id = as.character(observation_id),
+        time_point = as.character(lubridate::interval(
+          lubridate::with_tz(start_datetime, "Europe/Copenhagen"),
+          lubridate::with_tz(end_datetime, "Europe/Copenhagen")
+        )),
+        value
+      ),
+    by = c("ssid", "id")
+  ) %>%
+  mutate(responsible_site = coalesce(responsible_site_anchor, responsible_site)) %>%
+  select(-responsible_site_anchor) %>%
+  relocate(id, ssid, responsible_site, source, time_point, variable_name, value, issue_type, note)
+
+# =================================================
+# B) Baseline IMV type vs Dayform1 MV (TRUE/FALSE)
+# =================================================
+issue_mv_baseline_imv_vs_day1 <- anchor_wide %>%
+  mutate(ssid = as.character(ssid)) %>%
+  left_join(
+    first_trial_dayform_1_to_90_wide %>% mutate(ssid = as.character(ssid)),
+    by = "ssid"
+  ) %>%
+  mutate(
+    baseline_imv =
+      !is.na(baseline__type_of_respiratory_support) &
+      baseline__type_of_respiratory_support == "Invasive mechanical ventilation",
+
+    rule_violation =
+      baseline_imv & (is.na(first_instance_mv) | first_instance_mv != TRUE)
+  ) %>%
+  filter(rule_violation) %>%
+  transmute(
+    ssid,
+    responsible_site = enrolment_site,
+
+    # obs ids for drill-down
+    id_1 = baseline__type_of_respiratory_support__observation_id,
+    id_2 = first_instance_mv_obsid,
+
+    variable_name = "baseline_imv_requires_day1_mv_true",
+    issue_type = "hard",
+    note = paste0(
+      "Data validation: mismatch between the use of invasive mechanical ventilation on the baseline and day form 1:  ",
+      "baseline=", baseline__type_of_respiratory_support,
+      ", day form 1=", first_instance_mv,
+      ". Please check both the baseline and day form 1 values for invasive mechanical ventilation."
+    )
+  )
+
+validation_mv_baseline_imv_vs_day1 <- issue_mv_baseline_imv_vs_day1 %>%
+  transmute(
+    ssid,
+    id = id_2,  # dayform obs id
+    responsible_site,
+    variable_name,
+    issue_type,
+    note
+  ) %>%
+  left_join(
+    first_dayform_1_to_90_long %>%
+      transmute(
+        ssid,
+        responsible_site_dayform = responsible_site,
+        source = form_layout,
+        id = as.character(observation_id),
+        time_point = as.character(lubridate::interval(
+          lubridate::with_tz(start_datetime, "Europe/Copenhagen"),
+          lubridate::with_tz(end_datetime, "Europe/Copenhagen")
+        )),
+        value
+      ),
+    by = c("ssid", "id")
+  ) %>%
+  mutate(responsible_site = coalesce(responsible_site_dayform, responsible_site)) %>%
+  select(-responsible_site_dayform) %>%
+  relocate(id, ssid, responsible_site, source, time_point, variable_name, value, issue_type, note)
+
+# =================================================
+# Combined output
+# =================================================
+validation_mechanical_ventilation <- bind_rows(
+  validation_mv_screen_base_mismatch,
+  validation_mv_baseline_imv_vs_day1
+)
+
+rm(
+  validation_mv_screen_base_mismatch,
+  validation_mv_baseline_imv_vs_day1
+)
+```
+
+#### 4.6.4 Circulatory logic check
+
+```{r}
+# -------------------------------------------------
+#   Cross-check: screening circulatory support (TRUE/FALSE) vs dayform1 first_instance_circ (TRUE/FALSE)
+# -------------------------------------------------
+issue_circulatory_support <- anchor_wide %>%
+  mutate(ssid = as.character(ssid)) %>%
+  left_join(
+    first_trial_dayform_1_to_90_wide %>% mutate(ssid = as.character(ssid)),
+    by = "ssid"
+  ) %>%
+  mutate(
+    # mismatch when screening is TRUE but dayform1 is FALSE/NA,
+    # or screening is FALSE but dayform1 is TRUE
+    rule_violation =
+      (screening__use_of_circulatory_support_at_randomisation %in% TRUE &
+         (is.na(first_instance_circ) | first_instance_circ %in% FALSE)) |
+      (screening__use_of_circulatory_support_at_randomisation %in% FALSE &
+         first_instance_circ %in% TRUE)
+  ) %>%
+  filter(rule_violation) %>%
+  transmute(
+    ssid,
+    responsible_site = enrolment_site,
+
+    # keep obs ids for drill-down
+    id_1 = screening__use_of_circulatory_support_at_randomisation__observation_id,
+    id_2 = first_instance_circ_obsid,
+
+    variable_name = "screening_circulatory_support_vs_dayform1_mismatch",
+    issue_type = "soft",
+    note = paste0(
+      "Data validation: mismatch between the use circulatory support on the screening- and day form 1:  ",
+      "screening=", screening__use_of_circulatory_support_at_randomisation,
+      ", day form 1=", first_instance_circ,
+      ". Please check both the screening and day form 1 values for circulatory support."
+    )
+  )
+
+# Join with anchor to long format report:
+validation_circulatory_support <- issue_circulatory_support %>%
+  transmute(
+    ssid,
+    id = id_2 ,  # join on the primary observation id (screening circulatory support)
+    responsible_site,
+    variable_name,
+    issue_type,
+    note
+  ) %>%
+  left_join(
+    first_dayform_1_to_90_long  %>%
+      transmute(
+        ssid,
+        responsible_site_anchor = responsible_site,
+        source = form_layout,
+        id = as.character(observation_id),
+        time_point = as.character(lubridate::interval(
+          lubridate::with_tz(start_datetime, "Europe/Copenhagen"),
+          lubridate::with_tz(end_datetime, "Europe/Copenhagen")
+        )),
+        value
+      ),
+    by = c("ssid", "id")
+  ) %>%
+  mutate(
+    responsible_site = coalesce(responsible_site_anchor, responsible_site)
+  ) %>%
+  select(-responsible_site_anchor) %>%
+  relocate(
+    id, ssid, responsible_site, source, time_point, variable_name, value, issue_type, note
+  )
+```
+
+```{r}
+# -------------------------------------------------
+# 2) Validation report
+# -------------------------------------------------
+validation_cross_form_logicals<- bind_rows(
+  validation_critically_illness,
+  validation_mechanical_ventilation,
+  validation_circulatory_support
+) 
+
+# -------------------------------------------------
+# Cleanup
+# -------------------------------------------------
+rm(first_dayform_1_to_90_long,
+   first_dayform_ids,
+   first_dayform_vals,
+   first_trial_dayform_1_to_90_wide,
+   issue_critically_illness,
+   issue_mv_screen_base_mismatch,
+   issue_mv_baseline_imv_vs_day1,
+   issue_circulatory_support,
+   baseline_vars,
+   screening_vars,
+   anchor,
+   anchor_baseline,
+   anchor_screening,
+   anchor_wide,
+   anchor_wide_ids,
+   anchor_wide_vals,
+   validation_critically_illness,
+   validation_mechanical_ventilation,
+   validation_circulatory_support)
+```
+
+## 5.0 Creation of final validation report
+
+```{r}
+Final_validation_report <- bind_rows(
+  validation_dates, 
+  validation_missing_values, 
+  validation_cross_form_logicals
+)
+
+Final_validation_report <- Final_validation_report %>%
+  mutate(
+    variable = coalesce(variable, variable_name)
+  ) %>%
+  select(-variable_name)
+```
+
+```{r}
+
+```
+
